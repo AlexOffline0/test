@@ -1,27 +1,30 @@
 from tkinter import *
 from tkinter import simpledialog, messagebox
-import sqlite3
-import os
 import sys
 import requests
-import threading
 
+# Import your other files
 import gacha
 import apps
-import data # Needs this to grab the SERVER_URL
+import data  # Required for data.SERVER_URL
 
-def get_db_path():
-    if getattr(sys, 'frozen', False):
-        return os.path.join(os.getcwd(), "login.db")
-    return "login.db"
+# ------------------- CENTRALIZED SYNC FUNCTIONS -------------------
+def get_friends(user):
+    try:
+        res = requests.get(f"{data.SERVER_URL}/get_friends/{user}", timeout=5)
+        if res.status_code == 200:
+            return res.json()
+    except:
+        return []
+    return []
 
-DB_FILE = get_db_path()
-
+# ------------------- MAIN APP CLASS -------------------
 class CoretonApp:
     def __init__(self, master, username):
         self.master = master
         self.username = username
         self.current_friend = None
+        self.chat_loop_id = None  # Tracks the refresh loop to prevent crashes
 
         self.master.title(f"Coreton - {self.username}")
         self.master.geometry("900x600")
@@ -29,8 +32,15 @@ class CoretonApp:
 
         self.setup_ui()
 
+    # ------------------- UI (YOUR ORIGINAL STYLING) -------------------
     def setup_ui(self):
-        self.label = Label(self.master, text=f"Welcome, {self.username}!", font=("Pixelify Sans", 24, "bold"), fg="#ff80ff", bg="#1a1a1a")
+        self.label = Label(
+            self.master, 
+            text=f"Welcome, {self.username}!",
+            font=("Pixelify Sans", 24, "bold"),
+            fg="#ff80ff",
+            bg="#1a1a1a",
+        )
         self.label.pack(pady=10)
 
         self.main_frame = Frame(self.master, bg="#1a1a1a")
@@ -93,54 +103,53 @@ class CoretonApp:
         ext_btn = Button(bottom_frame, text="EXTENSIONS", command=self.command_ext, bg="#00ccff", fg="#121212", font=("Pixelify Sans", 14, "bold"), width=15)
         ext_btn.pack(side=LEFT, padx=10)
 
-    # --- SERVER SYNCED LOGIC ---
+    # ------------------- UPDATED SYNC LOGIC -------------------
     def refresh_friends(self):
         self.friends_listbox.delete(0, END)
-        try:
-            # Asks the Ngrok server for the friends list!
-            res = requests.get(f"{data.SERVER_URL}/get_friends/{self.username}", timeout=5)
-            if res.status_code == 200:
-                for f in res.json(): 
-                    self.friends_listbox.insert(END, f)
-        except Exception as e:
-            print(f"Friend Sync Error: {e}")
+        friends = get_friends(self.username)
+        for f in friends:
+            self.friends_listbox.insert(END, f)
 
     def add_friend_ui(self):
         friend = simpledialog.askstring("Add Friend", "Enter username:")
         if friend:
             try:
-                # Tells the server to link you two
                 res = requests.post(f"{data.SERVER_URL}/add_friend", json={"user1": self.username, "user2": friend}, timeout=5)
                 if res.status_code == 200:
-                    messagebox.showinfo("Result", "Friend added successfully!")
+                    messagebox.showinfo("Result", "Friend added successfully")
+                else:
+                    messagebox.showerror("Error", "Could not add friend")
                 self.refresh_friends()
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not reach server: {e}")
+            except:
+                messagebox.showerror("Error", "Server Unreachable")
 
     def open_chat(self, event):
         selection = self.friends_listbox.curselection()
         if selection:
             self.current_friend = self.friends_listbox.get(selection[0])
-            self.chat_box.config(state=NORMAL)
-            self.chat_box.delete(1.0, END)
+            self.refresh_chat_loop()
+
+    def refresh_chat_loop(self):
+        if not self.current_friend: return
+        try:
+            res = requests.get(f"{data.SERVER_URL}/get_messages/{self.username}/{self.current_friend}", timeout=5)
+            if res.status_code == 200:
+                self.chat_box.config(state=NORMAL)
+                self.chat_box.delete(1.0, END)
+                for sender, message in res.json():
+                    name = "You" if sender == self.username else sender
+                    self.chat_box.insert(END, f"{name}: {message}\n")
+                self.chat_box.config(state=DISABLED)
+                self.chat_box.yview(END)
+            else:
+                print(f"Error loading chat: {res.text}")
+        except Exception as e:
+            print(f"Connection lost during refresh: {e}")
             
-            # Message history is pulled locally from DB_FILE
-            conn = sqlite3.connect(DB_FILE)
-            conn.execute("""CREATE TABLE IF NOT EXISTS messages 
-                            (id INTEGER PRIMARY KEY, sender TEXT, receiver TEXT, message TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT sender, message FROM messages
-                WHERE (sender=? AND receiver=?) OR (sender=? AND receiver=?)
-                ORDER BY timestamp
-            """, (self.username, self.current_friend, self.current_friend, self.username))
-            
-            for sender, message in cursor.fetchall():
-                self.chat_box.insert(END, f"{'You' if sender == self.username else sender}: {message}\n")
-            
-            conn.close()
-            self.chat_box.config(state=DISABLED)
-            self.chat_box.yview(END)
+        # Safely cancel the old loop before starting a new one
+        if self.chat_loop_id is not None:
+            self.master.after_cancel(self.chat_loop_id)
+        self.chat_loop_id = self.master.after(3000, self.refresh_chat_loop)
 
     def send_message(self):
         if not self.current_friend:
@@ -148,23 +157,19 @@ class CoretonApp:
             return
         msg = self.entry.get().strip()
         if msg:
-            # Saves sent message locally
-            conn = sqlite3.connect(DB_FILE)
-            conn.execute("""CREATE TABLE IF NOT EXISTS messages 
-                            (id INTEGER PRIMARY KEY, sender TEXT, receiver TEXT, message TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-            conn.execute("INSERT INTO messages (sender, receiver, message) VALUES (?, ?, ?)", (self.username, self.current_friend, msg))
-            conn.commit()
-            conn.close()
-            
-            self.display_message(f"You: {msg}")
-            self.entry.delete(0, END)
+            try:
+                payload = {"sender": self.username, "receiver": self.current_friend, "message": msg}
+                res = requests.post(f"{data.SERVER_URL}/send_message", json=payload, timeout=5)
+                
+                if res.status_code == 200:
+                    self.entry.delete(0, END)
+                    self.refresh_chat_loop() # Force screen update instantly
+                else:
+                    messagebox.showerror("Error", "Server rejected the message.")
+            except Exception as e:
+                messagebox.showerror("Connection Error", f"Could not send message: {e}")
 
-    def display_message(self, msg):
-        self.chat_box.config(state=NORMAL)
-        self.chat_box.insert(END, msg + "\n")
-        self.chat_box.config(state=DISABLED)
-        self.chat_box.yview(END)
-
+    # ------------------- LAUNCHERS -------------------
     def command_gacha(self):
         gacha.open_gacha_window()
 
@@ -178,5 +183,6 @@ def open_home_window(user):
     root.mainloop()
 
 if __name__ == "__main__":
+    # If run directly, look for a passed username or use Unknown
     username = sys.argv[1] if len(sys.argv) > 1 else "Unknown"
     open_home_window(username)
