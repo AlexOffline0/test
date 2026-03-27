@@ -1,0 +1,59 @@
+from tkinter import *
+import sqlite3
+import bcrypt
+from data import init_db  # ensure database exists
+
+# Initialize database
+init_db()
+
+# Function called when login button is pressed
+def submit():
+    username = entry_username.get()
+    password = entry_password.get()
+
+    # Connect to database
+    conn = sqlite3.connect('login.db')
+    cursor = conn.cursor()
+
+    # Fetch hashed password for this username
+    cursor.execute("SELECT password FROM users WHERE username = ?", (username,))
+    result = cursor.fetchone()
+    conn.close()
+
+    if result:  # if user exists
+        stored_hash = result[0]
+
+        # Check entered password against stored hash
+        if bcrypt.checkpw(password.encode('utf-8'), stored_hash):
+            label_result.config(text="Login successful ✅")
+        else:
+            label_result.config(text="Wrong password ❌")
+    else:
+        label_result.config(text="User not found ❌")
+
+
+# --- Tkinter GUI setup ---
+window = Tk()
+window.title("Login System")
+window.geometry("300x200")
+window.config(bg="#111111")
+
+# Username entry
+Label(window, text="Username:", fg="green", bg="#111111").pack(pady=(10,0))
+entry_username = Entry(window, bg="#111111", fg="green")
+entry_username.pack()
+
+# Password entry
+Label(window, text="Password:", fg="green", bg="#111111").pack(pady=(10,0))
+entry_password = Entry(window, bg="#111111", fg="green", show="*")
+entry_password.pack()
+
+# Login button
+Button(window, text="Login", command=submit).pack(pady=10)
+
+# Result label
+label_result = Label(window, text="", fg="green", bg="#111111")
+label_result.pack()
+
+# Start the GUI
+window.mainloop()
