@@ -1,69 +1,22 @@
 from tkinter import *
-
-# Wrap EVERYTHING in this function
-def open_apps_window():
-    app_win = Toplevel() # Use Toplevel, NOT Tk()
-    app_win.title("Extensions")
-    app_win.geometry("400x400")
-    
-    # Put all your existing apps.py UI code here
-    Label(app_win, text="Extensions Menu", font=("Arial", 20)).pack()
-
-# This part ensures it ONLY runs if you double-click apps.py directly
-if __name__ == "__main__":
-    root = Tk()
-    open_apps_window()
-    root.mainloop()
 from tkinter import simpledialog, messagebox
 import sqlite3
 import os
 import sys
+import requests
+import threading
 
-# Import the other files you've bundled
 import gacha
 import apps
+import data # Needs this to grab the SERVER_URL
 
 def get_db_path():
     if getattr(sys, 'frozen', False):
-        # This ensures the EXE looks in its current folder for the DB
         return os.path.join(os.getcwd(), "login.db")
     return "login.db"
 
 DB_FILE = get_db_path()
 
-# ------------------- DATABASE FUNCTIONS -------------------
-def get_friends(user):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT user2 FROM friends WHERE user1 = ?
-        UNION
-        SELECT user1 FROM friends WHERE user2 = ?
-    """, (user, user))
-    friends = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return friends
-
-def add_friend_db(user, friend):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT username FROM users WHERE username = ?", (friend,))
-    if not cursor.fetchone():
-        conn.close()
-        return "User does not exist"
-    cursor.execute("""
-        SELECT * FROM friends 
-        WHERE (user1=? AND user2=?) OR (user1=? AND user2=?)
-    """, (user, friend, friend, user))
-    if cursor.fetchone():
-        conn.close()
-        return "Already friends"
-    cursor.execute("INSERT OR IGNORE INTO friends (user1, user2) VALUES (?, ?)", (user, friend))
-    conn.commit()
-    conn.close()
-    return "Friend added successfully"
-
-# ------------------- MAIN APP CLASS -------------------
 class CoretonApp:
     def __init__(self, master, username):
         self.master = master
@@ -76,18 +29,8 @@ class CoretonApp:
 
         self.setup_ui()
 
-    # ------------------- UI (UNCHANGED) -------------------
     def setup_ui(self):
-        self.label = Label(
-            self.master, 
-            text=f"Welcome, {self.username}!",
-            font=("Pixelify Sans", 24, "bold"),
-            fg="#ff80ff",
-            bg="#1a1a1a",
-
-        
-        )
-
+        self.label = Label(self.master, text=f"Welcome, {self.username}!", font=("Pixelify Sans", 24, "bold"), fg="#ff80ff", bg="#1a1a1a")
         self.label.pack(pady=10)
 
         self.main_frame = Frame(self.master, bg="#1a1a1a")
@@ -144,27 +87,35 @@ class CoretonApp:
         bottom_frame = Frame(self.master, bg="#1a1a1a")
         bottom_frame.pack(pady=10)
 
-        # CHANGED: These now call Python functions, not external .exes
         gacha_btn = Button(bottom_frame, text="GACHA", command=self.command_gacha, bg="#ff80ff", fg="#121212", font=("Pixelify Sans", 14, "bold"), width=15)
         gacha_btn.pack(side=LEFT, padx=10)
 
         ext_btn = Button(bottom_frame, text="EXTENSIONS", command=self.command_ext, bg="#00ccff", fg="#121212", font=("Pixelify Sans", 14, "bold"), width=15)
         ext_btn.pack(side=LEFT, padx=10)
 
-        
-
-    # ------------------- LOGIC METHODS (UNCHANGED) -------------------
+    # --- SERVER SYNCED LOGIC ---
     def refresh_friends(self):
         self.friends_listbox.delete(0, END)
-        for f in get_friends(self.username):
-            self.friends_listbox.insert(END, f)
+        try:
+            # Asks the Ngrok server for the friends list!
+            res = requests.get(f"{data.SERVER_URL}/get_friends/{self.username}", timeout=5)
+            if res.status_code == 200:
+                for f in res.json(): 
+                    self.friends_listbox.insert(END, f)
+        except Exception as e:
+            print(f"Friend Sync Error: {e}")
 
     def add_friend_ui(self):
         friend = simpledialog.askstring("Add Friend", "Enter username:")
         if friend:
-            result = add_friend_db(self.username, friend)
-            messagebox.showinfo("Result", result)
-            self.refresh_friends()
+            try:
+                # Tells the server to link you two
+                res = requests.post(f"{data.SERVER_URL}/add_friend", json={"user1": self.username, "user2": friend}, timeout=5)
+                if res.status_code == 200:
+                    messagebox.showinfo("Result", "Friend added successfully!")
+                self.refresh_friends()
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not reach server: {e}")
 
     def open_chat(self, event):
         selection = self.friends_listbox.curselection()
@@ -172,15 +123,21 @@ class CoretonApp:
             self.current_friend = self.friends_listbox.get(selection[0])
             self.chat_box.config(state=NORMAL)
             self.chat_box.delete(1.0, END)
+            
+            # Message history is pulled locally from DB_FILE
             conn = sqlite3.connect(DB_FILE)
+            conn.execute("""CREATE TABLE IF NOT EXISTS messages 
+                            (id INTEGER PRIMARY KEY, sender TEXT, receiver TEXT, message TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT sender, message FROM messages
                 WHERE (sender=? AND receiver=?) OR (sender=? AND receiver=?)
                 ORDER BY timestamp
             """, (self.username, self.current_friend, self.current_friend, self.username))
+            
             for sender, message in cursor.fetchall():
                 self.chat_box.insert(END, f"{'You' if sender == self.username else sender}: {message}\n")
+            
             conn.close()
             self.chat_box.config(state=DISABLED)
             self.chat_box.yview(END)
@@ -191,10 +148,14 @@ class CoretonApp:
             return
         msg = self.entry.get().strip()
         if msg:
+            # Saves sent message locally
             conn = sqlite3.connect(DB_FILE)
+            conn.execute("""CREATE TABLE IF NOT EXISTS messages 
+                            (id INTEGER PRIMARY KEY, sender TEXT, receiver TEXT, message TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
             conn.execute("INSERT INTO messages (sender, receiver, message) VALUES (?, ?, ?)", (self.username, self.current_friend, msg))
             conn.commit()
             conn.close()
+            
             self.display_message(f"You: {msg}")
             self.entry.delete(0, END)
 
@@ -204,7 +165,6 @@ class CoretonApp:
         self.chat_box.config(state=DISABLED)
         self.chat_box.yview(END)
 
-    # ------------------- UPDATED LAUNCHERS -------------------
     def command_gacha(self):
         gacha.open_gacha_window()
 
